@@ -18,7 +18,7 @@ from time import time
 from datetime import timedelta
 import numpy as np
 from scipy.ndimage import zoom
-from scipy.misc import logsumexp
+#from scipy.misc import logsumexp
 from scipy.integrate import odeint
 from scipy.stats import zscore
 from warnings import warn
@@ -33,10 +33,10 @@ import torchvision
 import torchvision.transforms as transforms
 import tensorflow.compat.v1 as tf
 from multiprocessing.dummy import Pool as ThreadPool
-import sys
-sys.path.append('/Users/mac/Desktop/My_module')
-import Guided_CAM
-import CAM_lastFC
+#import sys
+#sys.path.append('/Users/mac/Desktop/My_module')
+#import Guided_CAM
+#import CAM_lastFC
 
 
 
@@ -72,6 +72,9 @@ def fast_norm(x):
 
 def asymptotic_decay(scalar, t, max_iter):
     return scalar / (1+t/(max_iter/2))
+
+def inhibition_up(scalar, t, max_iter):
+    return scalar + np.log(1+t/(max_iter/10))
 
 def none_decay(scalar, t, max_iter):
     return scalar
@@ -115,6 +118,8 @@ class VTCSOM(minisom.MiniSom):
         # initialization theta and g
         self.theta = np.zeros((x, y))
         self.G = np.zeros((x*y, x*y))
+        self.excitory_value = np.zeros((x,y,x,y))
+        self.inhibition_value = np.zeros((x,y,x,y))
 
 
         self._x = x
@@ -124,6 +129,7 @@ class VTCSOM(minisom.MiniSom):
         self._neigy = np.arange(y)  # used to evaluate the neighborhood function
         self._lr_decay_function = lr_decay_function
         self._sigma_decay_function = sigma_decay_function
+        self._inhibition_up_function = inhibition_up
 
         neig_functions = {'gaussian': self._gaussian,
                           'eccentricity_gaussian': self._eccentricity_gaussian,
@@ -131,6 +137,7 @@ class VTCSOM(minisom.MiniSom):
                           'mexican_hat': self._mexican_hat,
                           'bubble': self._bubble,
                           'triangle': self._triangle,
+                          'circle': self._circle,
                           'nowinner_gaussian': self._nowinner_gaussian}
 
         if neighborhood_function not in neig_functions:
@@ -150,9 +157,8 @@ class VTCSOM(minisom.MiniSom):
         self.M = np.zeros((4096,4096))
         for index in range(4096):
             i,j = np.unravel_index(index, (x,y))
-            d = 3
-            #d = 1 * np.exp(-0.1*np.abs(j-32))    # big d in center, small d in around
-            self.M[index,:] = self.neighborhood((i,j),d).reshape(4096)
+            #sigma = 1 * np.exp(-0.1*np.abs(j-32))    # big sigma in center, small sigma in around
+            self.M[index,:] = self.neighborhood((i,j),sigma).reshape(4096)
         self.Normalize_M()
         
 #        self.M = np.random.randn(4096,4096)
@@ -329,15 +335,19 @@ class VTCSOM(minisom.MiniSom):
             ay += np.exp(-np.power(self._neigy-j, 2)/d)
         return np.outer(ax, ay)  # the external product gives a matrix   
     
-    def _eccentricity_gaussian(self, c, sigma):
-        """sigma1 > sigma2"""
-        sigma1 = sigma+0.5
-        sigma2 = sigma
+    def _eccentricity_gaussian(self, c, sigma1, sigma2):
+        """sigma1 < sigma2"""
+        sigma1 = sigma1
+        sigma2 = sigma2
         d1 = 2*np.pi*sigma1*sigma1
         d2 = 2*np.pi*sigma2*sigma2
         ax = np.exp(-np.power(self._neigx-c[0], 2)/d1)
         ay = np.exp(-np.power(self._neigy-c[1], 2)/d2)
         return np.outer(ax, ay)
+    
+    def _circle(self, c, sigma):
+        temp = self._gaussian(c, sigma)
+        return np.where(temp>0.1, 1, 0)
     
     
     
@@ -380,10 +390,14 @@ class VTCSOM(minisom.MiniSom):
         t_error = np.array([])
         for t, iteration in enumerate(tqdm(iterations)):
             t = t + start_num
+            gamma = self._lr_decay_function(0.1, t, end_num)
             self.update_long_range_similar_neuron_inhibition(data[iteration], 
                                                              self.activate(data[iteration]),
                                                              self.winner(data[iteration]), 
-                                                             t, end_num) 
+                                                             t, end_num, gamma=gamma) 
+            if t%150==0:
+                self.inhibition_value = np.where(self.inhibition_value>=np.percentile(self.inhibition_value,90), self.inhibition_value, 0)
+                self.excitory_value = np.where(self.excitory_value>=np.percentile(self.excitory_value,90), self.excitory_value, 0)
             if (t+1) % step_len == 0:
                 q_error = np.append(q_error, self.quantization_error(data))
                 t_error = np.append(t_error, self.topographic_error(data))
@@ -548,13 +562,7 @@ class VTCSOM(minisom.MiniSom):
 #            plt.imshow(solution[-1].reshape(64,64))
 #            plt.colorbar()
             ## update weights of W and M
-            # update SOM weights
-            winner_neuron_index = np.argmax(solution[-1,:])
-            neighbor_connection = self.M[winner_neuron_index,:].reshape(self._x, self._y)
-            neighbor_connection = tune(neighbor_connection)
-            self.update_structure_constrained_by_M(data[iteration], t, end_num, 
-                                                   neighbor_connection)
-            # update reccurent connection weights
+            # update M
             if hebb_type=='basic_hebb':
                 self.basic_hebb_update(data[iteration], solution[-1,:], update_object='M')
                 self.Normalize_M()
@@ -563,13 +571,7 @@ class VTCSOM(minisom.MiniSom):
                                      update_object='M')
                 self.Normalize_M()
                 self.M = np.where(self.M>0.01, 0.01, self.M)
-                self.M = np.where(self.M<-0.01, -0.01, self.M)
-#                plt.figure()
-#                plt.imshow(self.M)
-#                plt.colorbar()
-#                plt.figure()
-#                plt.imshow(self.M[winner_neuron_index].reshape(64,64))
-#                plt.colorbar()                
+                self.M = np.where(self.M<-0.01, -0.01, self.M)               
             if hebb_type=='BCM_hebb':
                 self.BCM_hebb_update(data[iteration], solution[-1,:], 
                                      tao_M=1, tao_theta=0.1, update_object='M')
@@ -580,8 +582,20 @@ class VTCSOM(minisom.MiniSom):
                 self.Normalize_M()
                 self.M = np.where(self.M>0.01, 0.01, self.M)
                 self.M = np.where(self.M<-0.01, -0.01, self.M)
+#                plt.figure()
+#                plt.imshow(self.M)
+#                plt.colorbar()
+#                plt.figure()
+#                plt.imshow(self.M[winner_neuron_index].reshape(64,64))
+#                plt.colorbar() 
             if hebb_type==None:
-                pass             
+                pass  
+            # update W
+            winner_neuron_index = np.argmax(solution[-1,:])
+            neighbor_connection = self.M[winner_neuron_index,:].reshape(self._x, self._y)
+            neighbor_connection = tune(neighbor_connection)
+            self.update_structure_constrained_by_M(data[iteration], t, end_num, 
+                                                   neighbor_connection)
             
             # prune the small M
             if t%10==0:
@@ -705,8 +719,8 @@ class VTCSOM(minisom.MiniSom):
     def _activate_recurrent_firing_rate(self, x, process_type):
         if process_type=='dynamics':
             def F(x):
-                return np.where(x<=0, 0, 0.8*x)
-                #return x
+                #return np.where(x<=0, 0, 0.8*x)
+                return x
             def diff_equation(v, t, M, H, tao, noise_level):
                 h = H
                 Change = F(np.dot(M,v)+h)
@@ -714,13 +728,13 @@ class VTCSOM(minisom.MiniSom):
                 return dvdt
             ## all-time feedforward + reccurent dynamic system
             times = np.linspace(0,10,100)
-            SOM_act = self.forward_activate(x)
-            H = SOM_act.reshape(-1)
+            SOM_act = self.activate(x)
+            H = 1/SOM_act.reshape(-1)
             solution = odeint(diff_equation, H, times, args=(self.M, H, 1.2, 0))
             return solution
         if process_type=='static':
-            SOM_act = self.forward_activate(x)
-            H = SOM_act.reshape(-1)
+            SOM_act = self.activate(x)
+            H = 1/SOM_act.reshape(-1)
             K = np.eye(self.M.shape[0]) - self.M
             K_inv = np.linalg.inv(K)
             solution = np.dot(K_inv, H)
@@ -781,28 +795,29 @@ class VTCSOM(minisom.MiniSom):
         self._weights += np.einsum('ij, ijk->ijk', g, x-self._weights)
         self.Normalize_W()
         
-    def update_long_range_similar_neuron_inhibition(self, x, activation, win, t, max_iteration):
-        eta = self._lr_decay_function(self._learning_rate, t, max_iteration)
-        sig = self._sigma_decay_function(self._sigma, t, max_iteration)
-        # make inhibition 
-        inhibition = np.zeros((self._x, self._y))
-        inhibition_pos = np.where(activation<np.percentile(activation,5))
-        inhibition_pos = list(zip(inhibition_pos[0],inhibition_pos[1]))
-        act_pop = np.where(self.neighborhood(win, sig)>0.1)
+    def update_long_range_similar_neuron_inhibition(self, x, activation, win, t, max_iteration, gamma):
+        activation = 1/activation
+        sig_exc = self._sigma_decay_function(self._sigma, t, max_iteration)   # excitory sigma
+        sig_inh = self._inhibition_up_function(self._sigma, t, max_iteration)   # inh sigma
+        exc_hebb_value = gamma * activation[win] * np.where(activation>=np.percentile(activation,50), activation, 0)
+        inh_hebb_value = gamma * activation[win] * np.where(activation>=np.percentile(activation,95), activation, 0)
+        # make excitory
+        self.excitory_value[win[0],win[1]] += exc_hebb_value * self.neighborhood(win, sig_exc)
+        exc_value = self.excitory_value[win[0],win[1]]
+        # make inhibition
+        act_pop = np.where(self._eccentricity_gaussian(win, sig_inh, 2+sig_inh)>0.1)
         act_pop = zip(act_pop[0], act_pop[1])
         for i in act_pop:
-            if i in inhibition_pos:
-                inhibition_pos.remove(i)
-        inhibition_pos = np.array(inhibition_pos)
-        inhibition_value = -self.neighborhood(win, 7) + self.neighborhood(win, sig)
-        if inhibition_pos.size!=0:
-            inhibition[inhibition_pos[:,0], inhibition_pos[:,1]] = inhibition_value[inhibition_pos[:,0], inhibition_pos[:,1]]
-        if inhibition_pos.size==0:
-            inhibition = 0
+            inh_hebb_value[i] = 0
+        self.inhibition_value[win[0],win[1]] += inh_hebb_value
+        inh_value = self.inhibition_value[win[0],win[1]]
         # update
-        g = (self.neighborhood(win, sig)+inhibition) * eta
+        g = exc_value - inh_value      # excitory and inhibition
         self._weights += np.einsum('ij, ijk->ijk', g, x-self._weights)
         self.Normalize_W()
+        # control weights
+        self.excitory_value = np.where(self.excitory_value>1, 1, self.excitory_value)
+        self.inhibition_value = np.where(self.inhibition_value>1, 1, self.inhibition_value)
         
     def update_structure_constrained_by_M(self, x, t, max_iteration, neighbor_connection):
         eta = self._lr_decay_function(self._learning_rate, t, max_iteration)
@@ -867,20 +882,29 @@ class VTCSOM(minisom.MiniSom):
                 self._weights[:,:,i] += (1/tao_M)*(h_temp*(h_temp-self.theta)*x[i])
                 
     def excitory_inhibition_hebb_update(self, x, H, t, max_iteration, gamma):
-        # excitoray
+        def eccentricity_inhibition(c, sigma1, sigma2):
+            d1 = 2*np.pi*sigma1*sigma1
+            d2 = 2*np.pi*sigma2*sigma2
+            ax = np.exp(-np.power(self._neigx-c[0], 2)/d1)
+            ay = np.exp(-np.power(self._neigy-c[1], 2)/d2)
+            return np.outer(ax, ay)
         winner_neuron_index = np.argmax(H)
         winner_neuron_pos = np.unravel_index(winner_neuron_index, (self._x,self._y))
         sig = self._sigma_decay_function(self._sigma, t, max_iteration)
-        g = self.neighborhood(winner_neuron_pos, sig)
-        g = g * self.M[winner_neuron_index,:].max()      # new g
-        self.M[winner_neuron_index,:] -= self.G[winner_neuron_index,:]    # except old g
-        self.M[winner_neuron_index,:] += g.reshape(-1)    # add new g
-        self.G[winner_neuron_index,:] = g.reshape(-1)     # update G by new g
+        # excitoray
+        excitory_range = self.neighborhood(winner_neuron_pos, sig)
+        excitory = excitory_range.reshape(-1)*H[winner_neuron_index]*np.where(H>0,H,0)
+        self.M[winner_neuron_index,:] += gamma * excitory
         # inhibition
-        act_pop = np.where(self.neighborhood(winner_neuron_pos, sig).reshape(-1)>0.1, 0, 1)
-        inhibition_gradient = -self.neighborhood(winner_neuron_pos, 7) + self.neighborhood(winner_neuron_pos, sig)
-        inhibition_gradient = inhibition_gradient.reshape(-1)
-        self.M[winner_neuron_index,:] += gamma*act_pop*inhibition_gradient*H[winner_neuron_index]*np.where(H>0,H,0)
+        inhibition_range = 1 - eccentricity_inhibition(winner_neuron_pos, sig+2, sig)
+        inhibition = inhibition_range.reshape(-1)*H[winner_neuron_index]*np.where(H>0,H,0)
+        inhibition = np.where(inhibition>=np.percentile(inhibition,90), inhibition, 0)
+        self.M[winner_neuron_index,:] -= gamma * inhibition
+        
+#        plt.figure()
+#        plt.imshow(excitory.reshape(64,64));plt.colorbar()
+#        plt.figure()
+#        plt.imshow(inhibition.reshape(64,64));plt.colorbar()
         
         
     def STDP_update(self, Output_current, tao, a, b):
@@ -1065,4 +1089,3 @@ if __name__ == '__main__':
     plt.xlabel('iteration index')
     
     
-                
