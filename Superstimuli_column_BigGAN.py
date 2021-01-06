@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import copy
 import cv2
+import itertools
 import nibabel as nib
 from tqdm import tqdm
 import numpy as np
@@ -18,7 +19,7 @@ import networkx as nx
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LinearRegression
 import sys
-sys.path.append('D:\\TDCNN')
+sys.path.append('/home/dell/TDCNN/')
 import BrainSOM
 from pytorch_pretrained_biggan import (BigGAN, truncated_noise_sample, file_utils)
 
@@ -46,14 +47,14 @@ alexnet = torchvision.models.alexnet(pretrained=True)
 alexnet = alexnet.cuda()
 alexnet.eval()
 
-Data = np.load('D:\\TDCNN\Results\Alexnet_fc8_SOM/Data.npy')
-pca = np.load('D:\\TDCNN\pca_imgnet_50w_mod1.pkl', allow_pickle=True)
+Data = np.load('/home/dell/TDCNN/Results/Alexnet_fc8_SOM/Data.npy')
+pca = PCA()
+pca.fit(Data)
 
-som = BrainSOM.VTCSOM(200, 200, 4, sigma=5, learning_rate=1, 
-                      neighborhood_function='gaussian', random_seed=None)
-som._weights = np.load(r'D:\\TDCNN\\Results\\Alexnet_fc8_SOM\\SOM_norm(200x200)_pca4_Sigma_200000step\som_sigma_8.0.npy')
+som = BrainSOM.VTCSOM(200, 200, 4, sigma=4, learning_rate=1, neighborhood_function='gaussian', random_seed=0)
+som._weights = np.load('/home/dell/TDCNN/Results/Alexnet_fc8_SOM/SOM(200x200)_pca4_Sigma_200000step/som_sigma_7.7.npy')
 
-biggan = torch.load(r'D:\TDCNN\GAN_models\biggan-deep-128.pkl')
+biggan = torch.load('/home/dell/TDCNN/GAN_models/biggan-deep-128.pkl')
 biggan = biggan.cuda()
 
 
@@ -62,11 +63,12 @@ biggan = biggan.cuda()
 ###############################################################################
 ###############################################################################
 def sigmoid(data):
-    return 1/(1+np.exp(-5*(data-0.4)))
+    return 1/(1+np.exp(-10*(data-0.4)))
 
 def column_segmentation(threshold):
     U = som.U_avg_matrix()
-    #U = sigmoid(U)
+    U_copy = copy.deepcopy(U)
+    U = sigmoid(U)
     diff_map = np.zeros((som._x,som._y))
     for i in range(som._x):
         for j in range(som._y):
@@ -90,63 +92,57 @@ def column_segmentation(threshold):
     plt.imshow(diff_map, cmap='jet')
     plt.axis('off')
     plt.figure(figsize=(7,7))
-    plt.imshow(U, cmap=plt.get_cmap('bone_r'))
+    plt.imshow(U_copy, cmap=plt.get_cmap('bone_r'))
     plt.imshow(diff_map, cmap='jet', alpha=0.2)
     plt.show()
     return diff_map
 
 def Column_position_set(diff_map):
-    columns = {0:[]}
-    for i in tqdm(range(1,som._x)):
-        for j in range(1,som._y):
-            if diff_map[i,j]==0:
-                pass
-            if diff_map[i,j]==1:
-                in_old_column = None
-                for col in columns.keys():
-                    for position in columns[col]:
-                        if position in [(i+1,j),(i-1,j),(i,j+1),(i,j-1)]:
-                            columns[col].append((i,j))
-                            in_old_column = 'yes'
-                if in_old_column == None:
-                    columns[col+1] = [(i,j)]
-                else:
-                    pass
-    for k in columns.keys():
-        columns[k] = list(set(columns[k]))
-    columns_set = {0:[]}
-    for v in columns.values():
-        temp = None
-        for col_index in columns_set.keys():
-            if set(v) & set(columns_set[col_index]) == set():
-                pass
+    def generative_column(seed_position):
+        one_column_pos = set()
+        one_column_pos.add(seed_position)
+        on_off = 1
+        while on_off==1:
+            one_column_pos_copy = copy.deepcopy(one_column_pos)
+            for seed_pos in one_column_pos:
+                for ii in range(seed_pos[0]-1, seed_pos[0]+2):
+                    for jj in range(seed_pos[1]-1, seed_pos[1]+2):
+                        if (ii >= 0 and ii < som._weights.shape[0] and
+                            jj >= 0 and jj < som._weights.shape[1] and diff_map[ii,jj]==1):   
+                            one_column_pos_copy.add((ii,jj))
+            if one_column_pos_copy==one_column_pos:
+                on_off = 0
             else:
-                temp = 1
-                for v_ in v:
-                    columns_set[col_index].append(v_)
-                columns_set[col_index] = list(set(columns_set[col_index]))
-        if temp == None:
-            columns_set[col_index+1] = v
-    return columns_set
+                one_column_pos = one_column_pos_copy
+        return one_column_pos
+    columns_position = zip(np.where(diff_map>0)[0], np.where(diff_map>0)[1])
+    columns_pos_list = []
+    for seed_position in columns_position:
+        if seed_position not in list(itertools.chain.from_iterable(columns_pos_list)):
+            columns_pos_list.append(generative_column(seed_position))
+    columns_pos_dict = dict()
+    for k,v in enumerate(columns_pos_list):
+        columns_pos_dict[k] = list(v)
+    return columns_pos_dict
                 
-def search_column_from_seed(columns_position_set, seed):
+def search_column_from_seed(columns_pos_dict, seed):
     is_seed_in_column = None
-    for k in columns_position_set.keys():
-        if seed in columns_position_set[k]:
+    for k in columns_pos_dict.keys():
+        if seed in columns_pos_dict[k]:
             is_seed_in_column = 1
             temp = np.zeros((som._x,som._y))
-            for eliment in columns_position_set[k]:
+            for eliment in columns_pos_dict[k]:
                 temp[eliment] = 1
             plt.figure(figsize=(7,7))
             plt.imshow(temp, cmap='jet')
-            return columns_position_set[k], temp
+            return columns_pos_dict[k], temp
     if is_seed_in_column==None:
         return None, None
         
   
-diff_map = column_segmentation(0.01)
-columns_position_set = Column_position_set(diff_map)
-column_position,pos = search_column_from_seed(columns_position_set, (135,8))
+diff_map = column_segmentation(0.001)
+columns_pos_dict = Column_position_set(diff_map)
+column_position,pos = search_column_from_seed(columns_pos_dict, (17,7))
 
 
 
@@ -155,29 +151,45 @@ column_position,pos = search_column_from_seed(columns_position_set, (135,8))
 """Superstimuli"""
 ###############################################################################
 ###############################################################################
-column_position,pos = search_column_from_seed(columns_position_set, (135,8))
- 
+column_position,pos = search_column_from_seed(columns_pos_dict, (100,150))
+
 W_column = [] 
+W_not_column = []
 for x in range(som._x):
     for y in range(som._y):
         if (x,y) in column_position:
             W_column.append(som._weights[x,y,:])
+        else:
+            W_not_column.append(som._weights[x,y,:])
 W_column = np.array(W_column).mean(axis=0)
+W_not_column = np.array(W_not_column).mean(axis=0)
 W = np.zeros(1000)
 W[:4] = W_column
-W_column = pca.inverse_transform(W)
+W = pca.inverse_transform(W)
 
+# initial noise
 torch.cuda.empty_cache()
 batch_size = 10
 truncation = 0.3
-#threshold = 10
-#W = np.where((W_column>=np.percentile(W_column,100-threshold)) | (W_column<=np.percentile(W_column,threshold)), W_column, 0)
-W = W_column
 weights_vector = torch.Tensor(np.tile(W.reshape(1,1000),(batch_size,1)))
 class_vector = weights_vector.cuda()
+r_column_mean = 0
+while r_column_mean<=0.5:
+    noise_vector = truncated_noise_sample(truncation=truncation, batch_size=batch_size)
+    noise_vector = torch.Tensor(noise_vector).cuda()
+    output = biggan(noise_vector, class_vector, truncation)
+    output = (output-output.min())/(output.max()-output.min())
+    inp = torch.nn.functional.interpolate(output, (224,224))
+    out = alexnet(inp)
+    r_column = torch.cosine_similarity(torch.Tensor(pca.transform(out.cpu().data)[:,:4]).cuda(),
+                                       torch.Tensor(W_column).unsqueeze(0).cuda())
+    r_column_mean = r_column.mean()
 
-noise_vector = truncated_noise_sample(truncation=truncation, batch_size=batch_size)
-noise_vector = torch.Tensor(noise_vector).cuda()
+# train
+batch_size = 10
+truncation = 0.3
+weights_vector = torch.Tensor(np.tile(W.reshape(1,1000),(batch_size,1)))
+class_vector = weights_vector.cuda()
 noise_vector.requires_grad_(True)
 optimizer = torch.optim.Adam([noise_vector], lr=0.1, betas=(0.9,0.999), weight_decay=0.005)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 20, gamma=0.1)
@@ -187,8 +199,10 @@ for t in tqdm(range(100)):
     output = (output-output.min())/(output.max()-output.min())
     inp = torch.nn.functional.interpolate(output, (224,224))
     out = alexnet(inp)
-    r_column = torch.cosine_similarity(out,torch.Tensor(W_column).unsqueeze(0).cuda())
+    r_column = torch.cosine_similarity(torch.Tensor(pca.transform(out.cpu().data)[:,:4]).cuda(),
+                                       torch.Tensor(W_column).unsqueeze(0).cuda())
     loss = -r_column
+    loss.requires_grad=True
     Correlation.append(r_column.max().item())
     optimizer.zero_grad()
     loss.backward(gradient=torch.ones(batch_size).cuda())
@@ -207,7 +221,7 @@ plt.figure()
 plt.imshow(RF, cmap='jet')
 plt.show()
 
-act = som.forward_activate(pca.transform(alexnet(inp.unsqueeze(0).cuda()).cpu().data.numpy())[0,[0,1,2,3]])
+act = 1/som.activate(pca.transform(alexnet(inp.unsqueeze(0).cuda()).cpu().data.numpy())[0,[0,1,2,3]])
 plt.figure()
 plt.imshow(act, cmap='jet')
 plt.colorbar()
@@ -231,14 +245,28 @@ def Superstimuli_on_Column(Column_img, column_position, RF, corelation):
         c.append(column_position[i][1])
     r_top = min(r)
     c_left = min(c)
-    paste_pos = (30*c_left, 30*r_top)
+    paste_pos = (10*c_left, 10*r_top)
     Column_img.paste(Superstimuli_img, paste_pos)
-    draw = ImageDraw.Draw(Column_img)
-    draw.text(paste_pos, str(round(corelation,2)), fill="#ff0000")
     return Column_img
+
+def Superstimuli_on_Column_with_text(Column_img_text, column_position, RF, corelation):
+    Superstimuli_img = Image.fromarray(np.uint8(RF*255)).convert('RGB')
+    Superstimuli_img = Superstimuli_img.resize((128,128))
+    r = []
+    c = []
+    for i in range(len(column_position)):
+        r.append(column_position[i][0])
+        c.append(column_position[i][1])
+    r_top = min(r)
+    c_left = min(c)
+    paste_pos = (10*c_left, 10*r_top)
+    Column_img_text.paste(Superstimuli_img, paste_pos)
+    draw = ImageDraw.Draw(Column_img_text)
+    draw.text(paste_pos, str(round(corelation,2)), fill="#ff0000")
+    return Column_img_text
    
 
-Columns_position = list(columns_position_set.values())
+Columns_position = list(columns_pos_dict.values())
 will_be_remove = []
 for column_position in Columns_position:
     if len(column_position)<4:
@@ -247,41 +275,44 @@ for remove_col in will_be_remove:
     Columns_position.remove(remove_col)
 
 
-batch_size = 1
+batch_size = 10
 truncation = 0.3
-threshold = 10
-Column_img = Image.fromarray(np.uint8(diff_map*255)).convert('RGB')
-Column_img = Column_img.resize((1920,1920))
-Column_cam = copy.deepcopy(Column_img)
-for column_position in Columns_position:     
+Column_img = Image.fromarray(np.uint8(diff_map*255)).convert('RGB').resize((2000,2000))
+Column_img_text = Image.fromarray(np.uint8(diff_map*255)).convert('RGB').resize((2000,2000))
+for column_position in tqdm(Columns_position):     
     W_column = [] 
-    for (x,y) in column_position:
-        W_column.append(som._weights[x,y,:])
+    W_not_column = []
+    for x in range(som._x):
+        for y in range(som._y):
+            if (x,y) in column_position:
+                W_column.append(som._weights[x,y,:])
+            else:
+                W_not_column.append(som._weights[x,y,:])
     W_column = np.array(W_column).mean(axis=0)
+    W_not_column = np.array(W_not_column).mean(axis=0)
     W = np.zeros(1000)
     W[:4] = W_column
-    W_column = pca.inverse_transform(W)
-    W_column = np.where(W_column>np.percentile(W_column,99.7), W_column, 0)
-    W_column = (W_column-W_column.min())/(W_column.max()-W_column.min())
+    W = pca.inverse_transform(W)
     
     torch.cuda.empty_cache()
-    W = np.where((W_column>=np.percentile(W_column,100-threshold)) | (W_column<=np.percentile(W_column,threshold)), W_column, 0)
     weights_vector = torch.Tensor(np.tile(W.reshape(1,1000),(batch_size,1)))
     class_vector = weights_vector.cuda()
-    
     noise_vector = truncated_noise_sample(truncation=truncation, batch_size=batch_size)
     noise_vector = torch.Tensor(noise_vector).cuda()
     noise_vector.requires_grad_(True)
-    optimizer = torch.optim.SGD([noise_vector], lr=0.01)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 25, gamma=250**(-1/3))
+    optimizer = torch.optim.Adam([noise_vector], lr=0.1, betas=(0.9,0.999), weight_decay=0.005)
+    #optimizer = torch.optim.SGD([noise_vector], lr=0.1, momentum=0.9, weight_decay=0.0005)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 20, gamma=250**(-1/3))
     Correlation = []
-    for t in tqdm(range(100)):
+    for t in range(100):
         output = biggan(noise_vector, class_vector, truncation)
         output = (output-output.min())/(output.max()-output.min())
         inp = torch.nn.functional.interpolate(output, (224,224))
         out = alexnet(inp)
-        r_column = torch.cosine_similarity(out,torch.Tensor(W_column).unsqueeze(0).cuda())
+        r_column = torch.cosine_similarity(torch.Tensor(pca.transform(out.cpu().data)[:,:4]).cuda(),
+                                           torch.Tensor(W_column).unsqueeze(0).cuda())
         loss = -r_column
+        loss.requires_grad = True
         Correlation.append(r_column.max().item())
         optimizer.zero_grad()
         loss.backward(gradient=torch.ones(batch_size).cuda())
@@ -294,8 +325,9 @@ for column_position in Columns_position:
     inp = output.cpu()
     RF = inp.permute(1,2,0).data.numpy()
     Column_img = Superstimuli_on_Column(Column_img, column_position, RF, r_column.max().item())
+    Column_img_text = Superstimuli_on_Column_with_text(Column_img_text, column_position, RF, r_column.max().item())
 
-Column_img.save('/nfs/s2/userhome/zhangyiyuan/Desktop/DCNN_SOM/GAN_images/Column_img.jpg')
-
+Column_img.save('/home/dell/TDCNN/Results/Alexnet_fc8_SOM/Column_img.jpg')
+Column_img_text.save('/home/dell/TDCNN/Results/Alexnet_fc8_SOM/Column_img_text.jpg')
 
 
